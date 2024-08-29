@@ -404,6 +404,7 @@ func (j *Job) runTask(input map[string][]byte, position int, retried bool) {
 	}
 
 	resp, err := j.Runner.Execute(&req)
+	log.Printf("Responfdfiosdjfoidjfdsse: %v", resp)
 	if err != nil {
 		if retried {
 			j.incError()

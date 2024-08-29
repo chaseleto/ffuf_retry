@@ -18,12 +18,16 @@ import (
 	"time"
 
 	"github.com/ffuf/ffuf/v2/pkg/ffuf"
-
 	"github.com/andybalholm/brotli"
 )
 
 // Download results < 5MB
 const MAX_DOWNLOAD_SIZE = 5242880
+
+const (
+	MAX_RETRIES = 3
+	RETRY_DELAY = 2 * time.Second
+)
 
 type SimpleRunner struct {
 	config *ffuf.Config
@@ -150,63 +154,67 @@ func (r *SimpleRunner) Execute(req *ffuf.Request) (ffuf.Response, error) {
 		rawreq, _ = httputil.DumpRequestOut(httpreq, true)
 	}
 
-	httpresp, err := r.client.Do(httpreq)
-	if err != nil {
-		return ffuf.Response{}, err
-	}
-
-	resp := ffuf.NewResponse(httpresp, req)
-	defer httpresp.Body.Close()
-
-	// Check if we should download the resource or not
-	size, err := strconv.Atoi(httpresp.Header.Get("Content-Length"))
-	if err == nil {
-		resp.ContentLength = int64(size)
-		if (r.config.IgnoreBody) || (size > MAX_DOWNLOAD_SIZE) {
-			resp.Cancelled = true
-			return resp, nil
-		}
-	}
-
-	if len(r.config.OutputDirectory) > 0 {
-		rawresp, _ := httputil.DumpResponse(httpresp, true)
-		resp.Request.Raw = string(rawreq)
-		resp.Raw = string(rawresp)
-	}
-	var bodyReader io.ReadCloser
-	if httpresp.Header.Get("Content-Encoding") == "gzip" {
-		bodyReader, err = gzip.NewReader(httpresp.Body)
+	for retries := 0; retries < MAX_RETRIES; retries++ {
+		httpresp, err := r.client.Do(httpreq)
 		if err != nil {
-			// fallback to raw data
+			return ffuf.Response{}, err
+		}
+		defer httpresp.Body.Close()
+
+		if httpresp.StatusCode == http.StatusTooManyRequests {
+			fmt.Printf("Received 429 Too Many Requests, retrying... (%d/%d)\n", retries+1, MAX_RETRIES)
+			if retries < MAX_RETRIES-1 {
+				time.Sleep(RETRY_DELAY)
+				continue
+			}
+		}
+
+		resp := ffuf.NewResponse(httpresp, req)
+
+		size, err := strconv.Atoi(httpresp.Header.Get("Content-Length"))
+		if err == nil {
+			resp.ContentLength = int64(size)
+			if (r.config.IgnoreBody) || (size > MAX_DOWNLOAD_SIZE) {
+				resp.Cancelled = true
+				return resp, nil
+			}
+		}
+
+		if len(r.config.OutputDirectory) > 0 {
+			rawresp, _ := httputil.DumpResponse(httpresp, true)
+			resp.Request.Raw = string(rawreq)
+			resp.Raw = string(rawresp)
+		}
+
+		var bodyReader io.ReadCloser
+		switch httpresp.Header.Get("Content-Encoding") {
+		case "gzip":
+			bodyReader, err = gzip.NewReader(httpresp.Body)
+			if err != nil {
+				bodyReader = httpresp.Body
+			}
+		case "br":
+			bodyReader = io.NopCloser(brotli.NewReader(httpresp.Body))
+		case "deflate":
+			bodyReader = flate.NewReader(httpresp.Body)
+		default:
 			bodyReader = httpresp.Body
 		}
-	} else if httpresp.Header.Get("Content-Encoding") == "br" {
-		bodyReader = io.NopCloser(brotli.NewReader(httpresp.Body))
-		if err != nil {
-			// fallback to raw data
-			bodyReader = httpresp.Body
+
+		if respbody, err := io.ReadAll(bodyReader); err == nil {
+			resp.ContentLength = int64(len(respbody))
+			resp.Data = respbody
 		}
-	} else if httpresp.Header.Get("Content-Encoding") == "deflate" {
-		bodyReader = flate.NewReader(httpresp.Body)
-		if err != nil {
-			// fallback to raw data
-			bodyReader = httpresp.Body
-		}
-	} else {
-		bodyReader = httpresp.Body
+
+		wordsSize := len(strings.Split(string(resp.Data), " "))
+		linesSize := len(strings.Split(string(resp.Data), "\n"))
+		resp.ContentWords = int64(wordsSize)
+		resp.ContentLines = int64(linesSize)
+		resp.Time = firstByteTime
+		return resp, nil
 	}
 
-	if respbody, err := io.ReadAll(bodyReader); err == nil {
-		resp.ContentLength = int64(len(string(respbody)))
-		resp.Data = respbody
-	}
-
-	wordsSize := len(strings.Split(string(resp.Data), " "))
-	linesSize := len(strings.Split(string(resp.Data), "\n"))
-	resp.ContentWords = int64(wordsSize)
-	resp.ContentLines = int64(linesSize)
-	resp.Time = firstByteTime
-	return resp, nil
+	return ffuf.Response{}, fmt.Errorf("max retries reached for request")
 }
 
 func (r *SimpleRunner) Dump(req *ffuf.Request) ([]byte, error) {
